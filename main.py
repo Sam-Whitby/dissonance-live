@@ -55,7 +55,6 @@ MAX_WIN_MS        = 2000
 N_HARMONICS       = 8           # harmonics used in dissonance model
 SYNTH_HARMONICS   = 10          # harmonics in synthesiser (richer timbre)
 SYNTH_ALPHA       = 1.5         # harmonic amplitude decay  A_h = 1 / h^alpha
-CHORD_DURATION    = 4.0         # seconds each chord is held in synth mode
 SYNTH_CHUNK       = 2048        # audio chunk size for synthesiser thread
 SYNTH_GAIN        = 0.18        # overall output gain (keeps signal from clipping)
 
@@ -139,33 +138,32 @@ def freq_to_staff(freq: float):
 #  CHORD SEQUENCES  (used by the synthesiser)
 # ─────────────────────────────────────────────────────────────────────────────
 CHORDS_2 = [
-    ("Octave",      ['C4', 'C5']),
-    ("Perfect 5th", ['C4', 'G4']),
-    ("Perfect 4th", ['C4', 'F4']),
-    ("Major 3rd",   ['C4', 'E4']),
+    ("Minor 2nd",   ['C4', 'Db4']),
+    ("Major 2nd",   ['C4', 'D4']),
     ("Minor 3rd",   ['C4', 'Eb4']),
-    ("Major 6th",   ['C4', 'A4']),
+    ("Major 3rd",   ['C4', 'E4']),
+    ("Perfect 4th", ['C4', 'F4']),
+    ("Tritone",     ['C4', 'Gb4']),
+    ("Perfect 5th", ['C4', 'G4']),
     ("Minor 6th",   ['C4', 'Ab4']),
+    ("Major 6th",   ['C4', 'A4']),
     ("Minor 7th",   ['C4', 'Bb4']),
     ("Major 7th",   ['C4', 'B4']),
-    ("Tritone",     ['C4', 'Gb4']),
-    ("Major 2nd",   ['C4', 'D4']),
-    ("Minor 2nd",   ['C4', 'Db4']),
 ]
 
 CHORDS_3 = [
-    ("C Major",  ['C4', 'E4', 'G4']),
-    ("C Minor",  ['C4', 'Eb4', 'G4']),
-    ("F Major",  ['F3', 'A3', 'C4']),
-    ("G Major",  ['G3', 'B3', 'D4']),
-    ("A Minor",  ['A3', 'C4', 'E4']),
-    ("D Minor",  ['D4', 'F4', 'A4']),
-    ("E Major",  ['E3', 'Ab3', 'B3']),
-    ("B dim",    ['B3', 'D4', 'F4']),
-    ("C aug",    ['C4', 'E4', 'Ab4']),
-    ("C sus4",   ['C4', 'F4', 'G4']),
-    ("G dom 7",  ['G3', 'B3', 'F4']),
-    ("A7 shell", ['A3', 'C#4', 'G4']),
+    ("C Major",    ['C4', 'E4', 'G4']),
+    ("C Minor",    ['C4', 'Eb4', 'G4']),
+    ("C dim",      ['C4', 'Eb4', 'Gb4']),
+    ("C aug",      ['C4', 'E4', 'Ab4']),
+    ("C sus4",     ['C4', 'F4', 'G4']),
+    ("C sus2",     ['C4', 'D4', 'G4']),
+    ("C dom7",     ['C4', 'E4', 'Bb4']),
+    ("C maj7",     ['C4', 'E4', 'B4']),
+    ("C min7",     ['C4', 'Eb4', 'Bb4']),
+    ("C dim7",     ['C4', 'Eb4', 'A4']),
+    ("C half-dim", ['C4', 'Eb4', 'Gb4']),
+    ("Stack 4ths", ['C4', 'F4', 'Bb4']),
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -386,7 +384,7 @@ class Synthesiser:
         self._audio_proc   = None
         self._out_stream   = None
         self._chord_idx    = 0
-        self._chord_t      = 0.0     # time within current chord
+        self._advance_flag = False   # set True by next_chord() to step forward
         self._phase_t      = 0.0     # cumulative phase time (for continuity)
         self._n_notes      = 2
 
@@ -435,14 +433,23 @@ class Synthesiser:
         with self._lock:
             return self.chord_name, list(self.note_names), list(self.note_freqs)
 
+    def next_chord(self):
+        """Advance to the next chord in the sequence (called on space bar)."""
+        with self._lock:
+            self._advance_flag = True
+
     # ── background thread ────────────────────────────────────────────────────
 
     def _run(self):
         dt = SYNTH_CHUNK / self.sr
         while self._running:
             with self._lock:
-                active  = self._active
-                n_notes = self._n_notes
+                active   = self._active
+                n_notes  = self._n_notes
+                # Check and consume the advance flag
+                if self._advance_flag:
+                    self._chord_idx   += 1
+                    self._advance_flag = False
 
             if active:
                 # Determine current chord
@@ -473,12 +480,7 @@ class Synthesiser:
                     self.note_names = note_info
                     self.note_freqs = freqs
 
-                # Advance chord timer
-                self._chord_t  += dt
-                self._phase_t  += dt
-                if self._chord_t >= CHORD_DURATION:
-                    self._chord_t = 0.0
-                    self._chord_idx += 1
+                self._phase_t += dt
 
             time.sleep(dt * 0.4)   # yield CPU
 
@@ -967,6 +969,11 @@ class App:
         self.synth.set_active(self.source == 'synth', n)
         self._switch_main_ax()
 
+    def _on_key(self, event):
+        if event.key == ' ' and self.source == 'synth':
+            self.synth.next_chord()
+            self.traj2.clear(); self.traj3.clear()
+
     def _on_clear(self, event):
         self.traj2.clear(); self.traj3.clear()
         for attr in ('traj2d', 'traj3_line', 'traj3d'):
@@ -1238,7 +1245,8 @@ class App:
 
         self._chord_txt.set_text(chord_name)
         self._source_txt.set_text(
-            '▶ Synthesiser' if self.source == 'synth' else '🎤 Microphone')
+            '▶ Synthesiser  [SPACE = next chord]' if self.source == 'synth'
+            else '🎤 Microphone')
 
         if not note_freqs:
             return
@@ -1352,6 +1360,8 @@ class App:
             self.synth.set_active(True, self.n_notes)
 
         print("Controls: select 'Synthesiser' to hear and analyse generated chords.")
+
+        self._key_cid = self.fig.canvas.mpl_connect('key_press_event', self._on_key)
 
         self.anim = FuncAnimation(
             self.fig, self.animate,
