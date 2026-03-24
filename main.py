@@ -38,7 +38,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.animation import FuncAnimation
-from matplotlib.widgets import Slider, Button, RadioButtons
+from matplotlib.widgets import Slider, RadioButtons
 from matplotlib.patches import Circle, FancyArrowPatch
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
@@ -52,11 +52,11 @@ DEFAULT_WIN_MS    = 500
 MIN_WIN_MS        = 100
 MAX_WIN_MS        = 2000
 
-N_HARMONICS       = 8           # harmonics used in dissonance model
-SYNTH_HARMONICS   = 10          # harmonics in synthesiser (richer timbre)
-SYNTH_ALPHA       = 1.5         # harmonic amplitude decay  A_h = 1 / h^alpha
-SYNTH_CHUNK       = 2048        # audio chunk size for synthesiser thread
+N_HARMONICS       = 16          # max harmonics tracked in analysis / dissonance model
+SYNTH_CHUNK       = 2048        # audio chunk size for synthesiser callback
 SYNTH_GAIN        = 0.18        # overall output gain (keeps signal from clipping)
+SYNTH_N_HARM_DEF  = 12          # default number of synthesised harmonics
+SYNTH_BETA_DEF    = 0.07        # default bow position (0.03=sul pont, 0.25=sul tasto)
 
 # Constant-Q Transform parameters
 CQT_BPO           = 24          # bins per octave (2 per semitone)
@@ -109,6 +109,11 @@ def note_to_freq(name: str) -> float:
     return 440.0 * 2 ** ((midi - 69) / 12.0)
 
 
+def midi_to_note(midi: int) -> str:
+    """Convert MIDI note number to name string, e.g. 60 → 'C4', 61 → 'Db4'."""
+    return f"{_DISP_NAMES[midi % 12]}{midi // 12 - 1}"
+
+
 def freq_to_staff(freq: float):
     """
     Map a frequency to a grand-staff y-coordinate.
@@ -134,37 +139,6 @@ def freq_to_staff(freq: float):
     return _DISP_NAMES[chroma], steps * 0.5, ('#' in _DISP_NAMES[chroma] or
                                                'b' in _DISP_NAMES[chroma])
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CHORD SEQUENCES  (used by the synthesiser)
-# ─────────────────────────────────────────────────────────────────────────────
-CHORDS_2 = [
-    ("Minor 2nd",   ['A3', 'Bb3']),
-    ("Major 2nd",   ['D4', 'E4']),
-    ("Minor 3rd",   ['F4', 'Ab4']),
-    ("Major 3rd",   ['G3', 'B3']),
-    ("Perfect 4th", ['B3', 'E4']),
-    ("Tritone",     ['D4', 'Ab4']),
-    ("Perfect 5th", ['E3', 'B3']),
-    ("Minor 6th",   ['A3', 'F4']),
-    ("Major 6th",   ['F3', 'D4']),
-    ("Minor 7th",   ['G3', 'F4']),
-    ("Major 7th",   ['C4', 'B4']),
-]
-
-CHORDS_3 = [
-    ("G Major",    ['G3', 'B3', 'D4']),
-    ("A Minor",    ['A3', 'C4', 'E4']),
-    ("E Minor",    ['E3', 'G3', 'B3']),
-    ("F Major",    ['F3', 'A3', 'C4']),
-    ("D Minor",    ['D4', 'F4', 'A4']),
-    ("B dim",      ['B3', 'D4', 'F4']),
-    ("C aug",      ['C4', 'E4', 'Ab4']),
-    ("E sus4",     ['E3', 'A3', 'B3']),
-    ("G dom7",     ['G3', 'B3', 'F4']),
-    ("C maj7",     ['C4', 'E4', 'B4']),
-    ("D min7",     ['D4', 'F4', 'C5']),
-    ("Stack 4ths", ['A2', 'D3', 'G3']),
-]
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SETHARES DISSONANCE MODEL
@@ -374,14 +348,13 @@ class CQTAnalyzer:
 # ─────────────────────────────────────────────────────────────────────────────
 class Synthesiser:
     """
-    Generates steady string-like chords on demand.
+    Generates string-like chords on demand with a physically-motivated
+    spectral envelope based on Helmholtz bow-motion theory.
 
-    Audio is produced directly inside the sounddevice OutputStream callback
-    so there is no inter-thread buffer and no rate-mismatch artefacts.
-    Phase is tracked with a single accumulator (_phase) that is private to
-    the audio thread, guaranteeing sample-accurate continuity between chunks.
-    Vibrato is intentionally absent: FM applied to a growing time offset
-    causes pitch to drift unboundedly.
+    See README §Bow position for the derivation.  Audio is produced
+    directly inside the sounddevice OutputStream callback — no inter-thread
+    buffer, no rate-mismatch artefacts.  A single phase accumulator
+    (_phase, audio-thread private) gives sample-accurate continuity.
     """
 
     def __init__(self, sr=SAMPLE_RATE):
@@ -389,23 +362,24 @@ class Synthesiser:
         self._lock         = threading.Lock()
         self._active       = False
         self._n_notes      = 2
-        self._chord_idx    = 0
         self._advance_flag = False
         self._audio_proc   = None
         self._out_stream   = None
-        self._running      = False       # used only by fallback inject thread
-        # Phase accumulator — written exclusively by the audio-producing thread
-        self._phase        = 0.0
+        self._running      = False
+        self._phase        = 0.0          # audio-thread only
+        self._rng          = np.random.default_rng()
 
-        h = np.arange(1, SYNTH_HARMONICS + 1, dtype=float)
-        self._harm_amps = 1.0 / h ** SYNTH_ALPHA
-        self._harm_amps /= self._harm_amps.sum()
+        # Bow-position spectral parameters (user-adjustable)
+        self._beta        = SYNTH_BETA_DEF    # contact point from bridge (0=bridge)
+        self._n_harmonics = SYNTH_N_HARM_DEF
+        self._harm_amps   = self._bow_amps(self._beta, self._n_harmonics)
 
         # Public readable state (protected by _lock)
         self.chord_name : str  = ''
         self.note_names : list = []
         self.note_freqs : list = []
-        self._update_chord_locked()   # populate with first chord
+        with self._lock:
+            self._new_random_chord()   # populate with first chord
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -420,7 +394,6 @@ class Synthesiser:
                 return
             except Exception as e:
                 print(f"Audio output unavailable: {e}")
-        # Fallback: background thread injects audio without speaker output
         self._running = True
         threading.Thread(target=self._inject_loop, daemon=True).start()
 
@@ -436,78 +409,126 @@ class Synthesiser:
             self._active  = active
             self._n_notes = n_notes
             if changed:
-                self._chord_idx = 0
-                self._update_chord_locked()
+                self._new_random_chord()
 
     def next_chord(self):
-        """Step to the next chord (called on SPACE bar)."""
+        """Queue a new random chord — consumed by the audio-producing thread."""
         with self._lock:
             self._advance_flag = True
+
+    def set_bow_pos(self, beta: float):
+        """β = bow contact point / string length  (0.03 = bridge, 0.25 = fingerboard)."""
+        with self._lock:
+            self._beta      = float(beta)
+            self._harm_amps = self._bow_amps(self._beta, self._n_harmonics)
+
+    def set_n_harmonics(self, n: int):
+        with self._lock:
+            self._n_harmonics = int(n)
+            self._harm_amps   = self._bow_amps(self._beta, self._n_harmonics)
 
     def get_state(self):
         with self._lock:
             return self.chord_name, list(self.note_names), list(self.note_freqs)
 
-    # ── internal helpers ──────────────────────────────────────────────────────
+    # ── spectral envelope ─────────────────────────────────────────────────────
 
-    def _update_chord_locked(self):
-        """Refresh chord_name / note_names / note_freqs. Caller must hold _lock."""
-        table = CHORDS_2 if self._n_notes == 2 else CHORDS_3
-        name, note_names = table[self._chord_idx % len(table)]
-        freqs = [note_to_freq(nn) for nn in note_names[:self._n_notes]]
-        self.chord_name = name
+    @staticmethod
+    def _bow_amps(beta: float, n: int) -> np.ndarray:
+        """
+        Helmholtz bow-motion spectral envelope.
+
+        For a string bowed at fractional position β from the bridge, the
+        amplitude of harmonic h in ideal Helmholtz motion is:
+
+            A_h  ∝  |sin(h π β)| / h
+
+        Derivation: the string velocity has a triangular Helmholtz wave
+        whose Fourier coefficients are sin(hπβ)/h (standard sawtooth
+        with the kink at β).  Near the bridge (β → 0), sin(hπβ) ≈ hπβ,
+        so A_h ≈ πβ — all harmonics are roughly equal (bright, glassy).
+        As β increases toward 0.25 (sul tasto), higher harmonics are
+        increasingly suppressed and nodes appear where hβ is an integer.
+        """
+        h    = np.arange(1, n + 1, dtype=float)
+        amps = np.abs(np.sin(h * np.pi * beta)) / h
+        s    = amps.sum()
+        if s > 0:
+            amps /= s           # unit-sum → peak stays within SYNTH_GAIN
+        return amps
+
+    # ── random chord ──────────────────────────────────────────────────────────
+
+    def _new_random_chord(self):
+        """
+        Pick a new random chord with all notes within one octave.
+        Caller must hold self._lock.
+
+        Root: MIDI 45–72  (A2–C5)
+        2-note: root + 1–12 semitones
+        3-note: root + i1 + i2  where 2 ≤ i1 < i2 ≤ 12
+        """
+        root = int(self._rng.integers(45, 73))
+        if self._n_notes == 2:
+            midis = [root, root + int(self._rng.integers(1, 13))]
+        else:
+            i1 = int(self._rng.integers(2, 11))
+            i2 = int(self._rng.integers(i1 + 1, 13))
+            midis = [root, root + i1, root + i2]
+        freqs = [440.0 * 2.0 ** ((m - 69) / 12.0) for m in midis]
+        self.chord_name = '  '.join(midi_to_note(m) for m in midis)
         self.note_names = [freq_to_staff(f) for f in freqs]
         self.note_freqs = freqs
 
-    def _gen(self, frames: int, freqs: list) -> np.ndarray:
-        """
-        Synthesise `frames` samples of the current chord.
+    # ── audio generation ──────────────────────────────────────────────────────
 
-        Uses a running phase accumulator so each chunk starts exactly where
-        the previous one ended — no clicks or pitch drift.
+    def _gen(self, frames: int, freqs: list, amps: np.ndarray) -> np.ndarray:
+        """
+        Synthesise `frames` samples.  `amps` is a snapshot taken under the
+        lock so we never hold it during the (slow) synthesis loop.
         """
         t   = np.arange(frames, dtype=float) / self.sr + self._phase
         sig = np.zeros(frames)
         n   = max(len(freqs), 1)
         for f in freqs:
-            for h_i, amp in enumerate(self._harm_amps, start=1):
+            for h_i, amp in enumerate(amps, start=1):
                 sig += (amp / n) * np.sin(2.0 * np.pi * f * h_i * t)
         self._phase += frames / self.sr
         return (sig * SYNTH_GAIN).astype(np.float32)
 
-    # ── sounddevice callback (audio thread) ───────────────────────────────────
+    # ── sounddevice callback ───────────────────────────────────────────────────
 
     def _out_cb(self, outdata, frames, time_info, status):
         with self._lock:
             if self._advance_flag:
-                self._chord_idx   += 1
-                self._advance_flag  = False
-                self._update_chord_locked()
+                self._advance_flag = False
+                self._new_random_chord()
             active = self._active
             freqs  = list(self.note_freqs)
+            amps   = self._harm_amps.copy()   # snapshot — don't hold lock during synthesis
 
         if active and freqs:
-            audio = self._gen(frames, freqs)
+            audio = self._gen(frames, freqs, amps)
             outdata[:, 0] = audio
             if self._audio_proc:
                 self._audio_proc.inject(audio)
         else:
             outdata[:] = 0.0
 
-    # ── fallback inject loop (no sounddevice) ─────────────────────────────────
+    # ── fallback inject loop ───────────────────────────────────────────────────
 
     def _inject_loop(self):
         dt = SYNTH_CHUNK / self.sr
         while self._running:
             with self._lock:
                 if self._advance_flag:
-                    self._chord_idx   += 1
-                    self._advance_flag  = False
-                    self._update_chord_locked()
+                    self._advance_flag = False
+                    self._new_random_chord()
                 active = self._active
                 freqs  = list(self.note_freqs)
+                amps   = self._harm_amps.copy()
             if active and freqs and self._audio_proc:
-                self._audio_proc.inject(self._gen(SYNTH_CHUNK, freqs))
+                self._audio_proc.inject(self._gen(SYNTH_CHUNK, freqs, amps))
             time.sleep(dt)
 
 
@@ -697,7 +718,7 @@ class App:
         outer = gridspec.GridSpec(
             2, 1, figure=self.fig,
             height_ratios=[3, 1], hspace=0.40,
-            left=0.05, right=0.97, top=0.94, bottom=0.17,
+            left=0.05, right=0.97, top=0.94, bottom=0.24,
         )
         top = gridspec.GridSpecFromSubplotSpec(
             1, 2, subplot_spec=outer[0],
@@ -901,26 +922,18 @@ class App:
     # ── controls ──────────────────────────────────────────────────────────────
 
     def _build_controls(self):
-        # Source radio: Microphone / Synthesiser
-        ax_src = plt.axes([0.05, 0.04, 0.14, 0.08])
+        sl_kw = dict(color='#334466', track_color='#1a1a33')
+
+        # Source radio
+        ax_src = plt.axes([0.05, 0.05, 0.14, 0.14])
         ax_src.set_facecolor('#10101e')
         self.radio_src = RadioButtons(
-            ax_src, ('Microphone', 'Synthesiser'),
-            active=0, activecolor='#55dd88')
+            ax_src, ('Microphone', 'Synthesiser'), active=0, activecolor='#55dd88')
         for lbl in self.radio_src.labels:
             lbl.set_color('#9999bb'); lbl.set_fontsize(8)
 
-        # FFT window slider
-        ax_win = plt.axes([0.24, 0.09, 0.20, 0.025])
-        self.sl_win = Slider(ax_win, 'FFT window (ms)',
-                             MIN_WIN_MS, MAX_WIN_MS,
-                             valinit=DEFAULT_WIN_MS, valstep=50,
-                             color='#334466', track_color='#1a1a33')
-        self.sl_win.label.set_color('#9999bb')
-        self.sl_win.valtext.set_color('#ccddff')
-
         # View mode radio
-        ax_view = plt.axes([0.49, 0.03, 0.26, 0.10])
+        ax_view = plt.axes([0.49, 0.04, 0.26, 0.17])
         ax_view.set_facecolor('#10101e')
         self.radio_view = RadioButtons(
             ax_view,
@@ -929,20 +942,45 @@ class App:
         for lbl in self.radio_view.labels:
             lbl.set_color('#9999bb'); lbl.set_fontsize(8)
 
-        # Clear path button
-        ax_clr = plt.axes([0.80, 0.07, 0.09, 0.04])
-        self.btn_clr = Button(ax_clr, 'Clear path',
-                              color='#1a1a33', hovercolor='#2a2a55')
-        self.btn_clr.label.set_color('#9999bb')
-        self.btn_clr.label.set_fontsize(8)
+        # ── Three stacked sliders (centre column) ─────────────────────────────
+        ax_win = plt.axes([0.24, 0.17, 0.20, 0.022])
+        self.sl_win = Slider(ax_win, 'FFT window (ms)',
+                             MIN_WIN_MS, MAX_WIN_MS,
+                             valinit=DEFAULT_WIN_MS, valstep=50, **sl_kw)
+        self.sl_win.label.set_color('#9999bb')
+        self.sl_win.valtext.set_color('#ccddff')
+
+        ax_nharm = plt.axes([0.24, 0.11, 0.20, 0.022])
+        self.sl_nharm = Slider(ax_nharm, 'Harmonics',
+                               4, 20, valinit=SYNTH_N_HARM_DEF, valstep=1, **sl_kw)
+        self.sl_nharm.label.set_color('#9999bb')
+        self.sl_nharm.valtext.set_color('#ccddff')
+
+        ax_bow = plt.axes([0.24, 0.05, 0.20, 0.022])
+        self.sl_bow = Slider(ax_bow, 'Bow pos',
+                             0.03, 0.25, valinit=SYNTH_BETA_DEF, **sl_kw)
+        self.sl_bow.label.set_color('#9999bb')
+        self.sl_bow.valtext.set_color('#ccddff')
+        # Add endpoint labels so the slider is self-explanatory
+        ax_bow.text(0.0, -0.9, 'sul\nponticello', transform=ax_bow.transAxes,
+                    color='#667799', fontsize=6, ha='left', va='top')
+        ax_bow.text(1.0, -0.9, 'sul\ntasto', transform=ax_bow.transAxes,
+                    color='#667799', fontsize=6, ha='right', va='top')
 
         self.sl_win.on_changed(self._on_win)
+        self.sl_nharm.on_changed(self._on_nharm)
+        self.sl_bow.on_changed(self._on_bow)
         self.radio_src.on_clicked(self._on_source)
         self.radio_view.on_clicked(self._on_view)
-        self.btn_clr.on_clicked(self._on_clear)
 
     def _on_win(self, v):
         self.audio.set_win_ms(int(v))
+
+    def _on_nharm(self, v):
+        self.synth.set_n_harmonics(int(v))
+
+    def _on_bow(self, v):
+        self.synth.set_bow_pos(float(v))
 
     def _on_source(self, label):
         synth = ('Synth' in label)
@@ -966,9 +1004,6 @@ class App:
     def _on_key(self, event):
         if event.key == ' ' and self.source == 'synth':
             self.synth.next_chord()
-
-    def _on_clear(self, event):
-        pass   # trajectories removed; button kept for layout
 
     # ── mode switch ───────────────────────────────────────────────────────────
 

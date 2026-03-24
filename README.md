@@ -50,28 +50,53 @@ Your live chord is a point on (or above) this surface.
 
 ### Harmonic amplitudes
 
-The FFT reveals the overtone spectrum of each string.
-At each detected fundamental `f₀` the code reads the FFT amplitude at
-`k f₀` for `k = 1 … n_harmonics`.
-These measured amplitudes replace the synthetic `1/k` decay in the
-roughness formula, so the curve/surface shape reflects the **actual** timbral
-richness of the instruments in the room.
-The shape changes gradually (exponential smoothing) as the playing changes.
+The CQT reveals the overtone spectrum of each string.
+At each detected fundamental `f₀` the code reads the CQT magnitude at the
+bin corresponding to `k f₀` for `k = 1 … N_HARMONICS` (default 16).
+These measured amplitudes drive the roughness formula, so the
+curve/surface shape reflects the **actual** timbral richness of the
+instruments.  The shape changes gradually (exponential smoothing) as the
+playing changes.
 
-### Note detection: iterative HPS
+### Note detection: CQT harmonic salience
 
-Multiple simultaneous notes are found by **iterative Harmonic Product
-Spectrum**:
+Simultaneous notes are found with a **Constant-Q Transform** and a
+vectorised harmonic-salience function:
 
-1. Compute the Blackman–Harris-windowed FFT magnitude.
-2. Apply the HPS (multiply spectrum with its own downsampled copies ×2, ×3, …
-   ×5). The peak in the result is the dominant fundamental `f₀₁`.
-3. Zero out the spectral content near every harmonic of `f₀₁`.
-4. Repeat on the residual spectrum to find `f₀₂`, then `f₀₃`.
+1. Compute a Blackman–Harris-windowed FFT; interpolate to log-spaced CQT bins.
+2. For each CQT bin *k* (candidate fundamental), sum magnitudes at harmonics
+   `k + bpo·log₂(h)` for `h = 1 … N_HARMONICS` — a fixed offset in log-frequency.
+3. The peak salience bin is the dominant fundamental.
+4. Mask its harmonics (±1.5 bins) in the CQT and repeat for subsequent notes.
 
-If fewer notes than expected are detected the loudest found note is
-duplicated (so the plot stays in the same dimensional space).
-If more are detected, only the three loudest are kept.
+CQT salience outperforms linear-FFT HPS for music because the harmonic
+series maps to **constant bin offsets** at all pitches simultaneously,
+and masking is precise in log-frequency space.
+
+### Bow position and overtone richness
+
+The synthesiser's spectral envelope is derived from **Helmholtz bow-motion
+theory**.  For a string bowed at fractional contact point **β** from the bridge
+(0 = bridge, 1 = nut), the amplitude of harmonic *h* in the ideal Helmholtz
+triangular velocity wave is:
+
+```
+A_h  ∝  |sin(h π β)| / h
+```
+
+This comes directly from the Fourier series of a sawtooth wave with its
+kink at position β.
+
+| β range | Playing style | Character |
+|---|---|---|
+| 0.03–0.06 | Sul ponticello (near bridge) | Bright, glassy — all harmonics roughly equal because sin(hπβ) ≈ hπβ |
+| 0.07–0.12 | Normal bowing | Warm — harmonics peak around *h* ≈ 1/(2β) then fall off |
+| 0.13–0.25 | Sul tasto (near fingerboard) | Dark, flute-like — harmonics above *h* ≈ 1/β are suppressed; nodes appear wherever *hβ* is an integer |
+
+The amplitudes are sum-normalised so overall volume stays constant across
+bow positions.  The **Harmonics** slider sets how many overtones are
+synthesised (4–20); more harmonics = richer timbre and more salience peaks
+for the CQT detector to work with.
 
 ---
 
@@ -118,11 +143,13 @@ python main.py
 
 | Control | Function |
 |---|---|
-| **2 notes / 3 notes** radio | Switch between 2-D curve and 3-D surface mode |
-| **FFT window** slider | Width of the analysis window in milliseconds. Wider → better pitch resolution; narrower → faster response |
-| **Harmonics** slider | How many overtones to include in the dissonance calculation |
-| **Clear path** button | Erase the trajectory drawn on the main plot |
-| **Mouse drag** (3-D surface) | Rotate the surface for a better viewing angle |
+| **Microphone / Synthesiser** radio | Toggle audio source |
+| **2 notes – curve / 3 notes – contour / 3 notes – 3D** radio | View mode |
+| **FFT window** slider | Analysis window width (ms). Wider → better pitch resolution; narrower → faster response |
+| **Harmonics** slider | Number of overtones synthesised (4–20). More = richer timbre |
+| **Bow pos** slider | Spectral envelope. Left (sul ponticello) = bright, many harmonics. Right (sul tasto) = dark, few harmonics |
+| **SPACE bar** | Advance to next random chord (synthesiser mode only) |
+| **Mouse drag** (3-D surface) | Rotate the 3-D dissonance surface |
 
 ---
 
