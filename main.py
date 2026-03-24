@@ -65,10 +65,9 @@ CQT_FMAX          = 4400.0      # highest CQT bin
 SALIENCE_THRESH   = 0.10        # minimum salience relative to peak to accept a note
 
 RATIO_MIN         = 1.0
-RATIO_MAX         = 2.5
+RATIO_MAX         = 2.0
 CURVE_POINTS      = 300
 SURF_POINTS       = 40
-TRAJ_LENGTH       = 200
 HIST_SECONDS      = 20.0
 ANIM_INTERVAL_MS  = 120
 
@@ -88,8 +87,9 @@ LABEL_NOTES = {
     'C5': 523.3, 'A5': 880.0, 'C6': 1046.5,
 }
 SIMPLE_RATIOS = {
-    '1:1': 1.0, '6:5': 6/5, '5:4': 5/4, '4:3': 4/3,
-    '3:2': 3/2, '5:3': 5/3, '2:1': 2.0,
+    '1:1': 1.0, '16:15': 16/15, '9:8': 9/8, '6:5': 6/5, '5:4': 5/4,
+    '4:3': 4/3, '√2': 2**0.5, '3:2': 3/2, '8:5': 8/5, '5:3': 5/3,
+    '16:9': 16/9, '15:8': 15/8, '2:1': 2.0,
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,32 +138,32 @@ def freq_to_staff(freq: float):
 #  CHORD SEQUENCES  (used by the synthesiser)
 # ─────────────────────────────────────────────────────────────────────────────
 CHORDS_2 = [
-    ("Minor 2nd",   ['C4', 'Db4']),
-    ("Major 2nd",   ['C4', 'D4']),
-    ("Minor 3rd",   ['C4', 'Eb4']),
-    ("Major 3rd",   ['C4', 'E4']),
-    ("Perfect 4th", ['C4', 'F4']),
-    ("Tritone",     ['C4', 'Gb4']),
-    ("Perfect 5th", ['C4', 'G4']),
-    ("Minor 6th",   ['C4', 'Ab4']),
-    ("Major 6th",   ['C4', 'A4']),
-    ("Minor 7th",   ['C4', 'Bb4']),
+    ("Minor 2nd",   ['A3', 'Bb3']),
+    ("Major 2nd",   ['D4', 'E4']),
+    ("Minor 3rd",   ['F4', 'Ab4']),
+    ("Major 3rd",   ['G3', 'B3']),
+    ("Perfect 4th", ['B3', 'E4']),
+    ("Tritone",     ['D4', 'Ab4']),
+    ("Perfect 5th", ['E3', 'B3']),
+    ("Minor 6th",   ['A3', 'F4']),
+    ("Major 6th",   ['F3', 'D4']),
+    ("Minor 7th",   ['G3', 'F4']),
     ("Major 7th",   ['C4', 'B4']),
 ]
 
 CHORDS_3 = [
-    ("C Major",    ['C4', 'E4', 'G4']),
-    ("C Minor",    ['C4', 'Eb4', 'G4']),
-    ("C dim",      ['C4', 'Eb4', 'Gb4']),
+    ("G Major",    ['G3', 'B3', 'D4']),
+    ("A Minor",    ['A3', 'C4', 'E4']),
+    ("E Minor",    ['E3', 'G3', 'B3']),
+    ("F Major",    ['F3', 'A3', 'C4']),
+    ("D Minor",    ['D4', 'F4', 'A4']),
+    ("B dim",      ['B3', 'D4', 'F4']),
     ("C aug",      ['C4', 'E4', 'Ab4']),
-    ("C sus4",     ['C4', 'F4', 'G4']),
-    ("C sus2",     ['C4', 'D4', 'G4']),
-    ("C dom7",     ['C4', 'E4', 'Bb4']),
+    ("E sus4",     ['E3', 'A3', 'B3']),
+    ("G dom7",     ['G3', 'B3', 'F4']),
     ("C maj7",     ['C4', 'E4', 'B4']),
-    ("C min7",     ['C4', 'Eb4', 'Bb4']),
-    ("C dim7",     ['C4', 'Eb4', 'A4']),
-    ("C half-dim", ['C4', 'Eb4', 'Gb4']),
-    ("Stack 4ths", ['C4', 'F4', 'Bb4']),
+    ("D min7",     ['D4', 'F4', 'C5']),
+    ("Stack 4ths", ['A2', 'D3', 'G3']),
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -373,49 +373,56 @@ class CQTAnalyzer:
 #  CQT pitch detection by spreading each partial slightly.
 # ─────────────────────────────────────────────────────────────────────────────
 class Synthesiser:
-    VIBRATO_RATE  = 5.0    # Hz
-    VIBRATO_DEPTH = 0.004  # fractional (±0.4 %)
+    """
+    Generates steady string-like chords on demand.
+
+    Audio is produced directly inside the sounddevice OutputStream callback
+    so there is no inter-thread buffer and no rate-mismatch artefacts.
+    Phase is tracked with a single accumulator (_phase) that is private to
+    the audio thread, guaranteeing sample-accurate continuity between chunks.
+    Vibrato is intentionally absent: FM applied to a growing time offset
+    causes pitch to drift unboundedly.
+    """
 
     def __init__(self, sr=SAMPLE_RATE):
         self.sr            = sr
         self._lock         = threading.Lock()
-        self._running      = False
-        self._active       = False    # True when synth mode is selected
+        self._active       = False
+        self._n_notes      = 2
+        self._chord_idx    = 0
+        self._advance_flag = False
         self._audio_proc   = None
         self._out_stream   = None
-        self._chord_idx    = 0
-        self._advance_flag = False   # set True by next_chord() to step forward
-        self._phase_t      = 0.0     # cumulative phase time (for continuity)
-        self._n_notes      = 2
+        self._running      = False       # used only by fallback inject thread
+        # Phase accumulator — written exclusively by the audio-producing thread
+        self._phase        = 0.0
 
-        # Harmonic amplitude envelope (string instrument approximation)
         h = np.arange(1, SYNTH_HARMONICS + 1, dtype=float)
         self._harm_amps = 1.0 / h ** SYNTH_ALPHA
         self._harm_amps /= self._harm_amps.sum()
 
-        # Thread-safe state readable by the App
-        self.chord_name  : str  = ''
-        self.note_names  : list = []   # list of (note_name, staff_y, is_acc)
-        self.note_freqs  : list = []   # Hz
-
-        # Output buffer (ring buffer for the OutputStream callback)
-        self._out_buf  = np.zeros(0, dtype=np.float32)
-        self._out_lock = threading.Lock()
+        # Public readable state (protected by _lock)
+        self.chord_name : str  = ''
+        self.note_names : list = []
+        self.note_freqs : list = []
+        self._update_chord_locked()   # populate with first chord
 
     # ── public API ────────────────────────────────────────────────────────────
 
     def start(self, audio_proc):
         self._audio_proc = audio_proc
-        self._running    = True
-        threading.Thread(target=self._run, daemon=True).start()
         if AUDIO_AVAILABLE:
             try:
                 self._out_stream = sd.OutputStream(
                     samplerate=self.sr, channels=1, dtype='float32',
                     blocksize=SYNTH_CHUNK, callback=self._out_cb)
                 self._out_stream.start()
+                return
             except Exception as e:
                 print(f"Audio output unavailable: {e}")
+        # Fallback: background thread injects audio without speaker output
+        self._running = True
+        threading.Thread(target=self._inject_loop, daemon=True).start()
 
     def stop(self):
         self._running = False
@@ -425,86 +432,83 @@ class Synthesiser:
 
     def set_active(self, active: bool, n_notes: int = 2):
         with self._lock:
+            changed = (n_notes != self._n_notes)
             self._active  = active
             self._n_notes = n_notes
-
-    def get_state(self):
-        """Thread-safe snapshot of current chord state."""
-        with self._lock:
-            return self.chord_name, list(self.note_names), list(self.note_freqs)
+            if changed:
+                self._chord_idx = 0
+                self._update_chord_locked()
 
     def next_chord(self):
-        """Advance to the next chord in the sequence (called on space bar)."""
+        """Step to the next chord (called on SPACE bar)."""
         with self._lock:
             self._advance_flag = True
 
-    # ── background thread ────────────────────────────────────────────────────
+    def get_state(self):
+        with self._lock:
+            return self.chord_name, list(self.note_names), list(self.note_freqs)
 
-    def _run(self):
+    # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _update_chord_locked(self):
+        """Refresh chord_name / note_names / note_freqs. Caller must hold _lock."""
+        table = CHORDS_2 if self._n_notes == 2 else CHORDS_3
+        name, note_names = table[self._chord_idx % len(table)]
+        freqs = [note_to_freq(nn) for nn in note_names[:self._n_notes]]
+        self.chord_name = name
+        self.note_names = [freq_to_staff(f) for f in freqs]
+        self.note_freqs = freqs
+
+    def _gen(self, frames: int, freqs: list) -> np.ndarray:
+        """
+        Synthesise `frames` samples of the current chord.
+
+        Uses a running phase accumulator so each chunk starts exactly where
+        the previous one ended — no clicks or pitch drift.
+        """
+        t   = np.arange(frames, dtype=float) / self.sr + self._phase
+        sig = np.zeros(frames)
+        n   = max(len(freqs), 1)
+        for f in freqs:
+            for h_i, amp in enumerate(self._harm_amps, start=1):
+                sig += (amp / n) * np.sin(2.0 * np.pi * f * h_i * t)
+        self._phase += frames / self.sr
+        return (sig * SYNTH_GAIN).astype(np.float32)
+
+    # ── sounddevice callback (audio thread) ───────────────────────────────────
+
+    def _out_cb(self, outdata, frames, time_info, status):
+        with self._lock:
+            if self._advance_flag:
+                self._chord_idx   += 1
+                self._advance_flag  = False
+                self._update_chord_locked()
+            active = self._active
+            freqs  = list(self.note_freqs)
+
+        if active and freqs:
+            audio = self._gen(frames, freqs)
+            outdata[:, 0] = audio
+            if self._audio_proc:
+                self._audio_proc.inject(audio)
+        else:
+            outdata[:] = 0.0
+
+    # ── fallback inject loop (no sounddevice) ─────────────────────────────────
+
+    def _inject_loop(self):
         dt = SYNTH_CHUNK / self.sr
         while self._running:
             with self._lock:
-                active   = self._active
-                n_notes  = self._n_notes
-                # Check and consume the advance flag
                 if self._advance_flag:
                     self._chord_idx   += 1
-                    self._advance_flag = False
-
-            if active:
-                # Determine current chord
-                table = CHORDS_2 if n_notes == 2 else CHORDS_3
-                name, note_names = table[self._chord_idx % len(table)]
-                freqs = [note_to_freq(nn) for nn in note_names[:n_notes]]
-
-                # Generate audio chunk
-                audio = self._synthesise(SYNTH_CHUNK, freqs)
-
-                # Inject into analyser
-                if self._audio_proc:
-                    self._audio_proc.inject(audio)
-
-                # Queue for speaker output
-                with self._out_lock:
-                    self._out_buf = np.concatenate([self._out_buf,
-                                                    audio.astype(np.float32)])
-                    # Cap to avoid growing lag (keep at most ~0.5 s)
-                    cap = self.sr // 2
-                    if len(self._out_buf) > cap:
-                        self._out_buf = self._out_buf[-cap:]
-
-                # Update public state
-                note_info = [freq_to_staff(f) for f in freqs]
-                with self._lock:
-                    self.chord_name = name
-                    self.note_names = note_info
-                    self.note_freqs = freqs
-
-                self._phase_t += dt
-
-            time.sleep(dt * 0.4)   # yield CPU
-
-    def _synthesise(self, n: int, freqs: list) -> np.ndarray:
-        """Produce n samples of a string-like chord with vibrato."""
-        t   = np.arange(n) / self.sr + self._phase_t
-        sig = np.zeros(n)
-        for f in freqs:
-            # Vibrato: multiply frequency by a slow sinusoid
-            vib = 1.0 + self.VIBRATO_DEPTH * np.sin(2*np.pi*self.VIBRATO_RATE*t)
-            for h, amp in enumerate(self._harm_amps, start=1):
-                sig += (amp / len(freqs)) * np.sin(2*np.pi * f*h * t * vib)
-        return sig * SYNTH_GAIN
-
-    # ── sounddevice output callback ───────────────────────────────────────────
-
-    def _out_cb(self, outdata, frames, time_info, status):
-        with self._out_lock:
-            n = min(frames, len(self._out_buf))
-            if n > 0:
-                outdata[:n, 0] = self._out_buf[:n]
-                self._out_buf  = self._out_buf[n:]
-            if n < frames:
-                outdata[n:, 0] = 0.0
+                    self._advance_flag  = False
+                    self._update_chord_locked()
+                active = self._active
+                freqs  = list(self.note_freqs)
+            if active and freqs and self._audio_proc:
+                self._audio_proc.inject(self._gen(SYNTH_CHUNK, freqs))
+            time.sleep(dt)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -655,9 +659,6 @@ class App:
         self.hw = np.array([1.0/k for k in range(1, N_HARMONICS+1)])
         self.hw /= self.hw.max()
 
-        self.traj2 = deque(maxlen=TRAJ_LENGTH)
-        self.traj3 = deque(maxlen=TRAJ_LENGTH)
-
         n_hist = int(HIST_SECONDS * 1000 / ANIM_INTERVAL_MS) + 10
         self.diss_hist = deque(maxlen=n_hist)
         self.time_hist = deque(maxlen=n_hist)
@@ -739,7 +740,6 @@ class App:
                                        alpha=0.18, color='#4466cc', zorder=3)
         self.pt2d,   = ax.plot([], [], 'o', color='#ffcc00', ms=12, zorder=8,
                                markeredgecolor='#ffffff', markeredgewidth=0.8)
-        self.traj2d, = ax.plot([], [], '-', color='#ff6633', lw=1.8, alpha=0.80, zorder=7)
         ax.set_xlim(RATIO_MIN, RATIO_MAX)
         ax.set_ylim(0, 1.15)
         for label, r in SIMPLE_RATIOS.items():
@@ -771,8 +771,6 @@ class App:
             self._pcm, ax=ax, fraction=0.03, pad=0.02, label='Dissonance')
         self._cbar.ax.yaxis.label.set_color('#9999bb')
         self._cbar.ax.tick_params(colors='#9999bb', labelsize=7)
-        self.traj3_line, = ax.plot([], [], '-', color='#00ffcc',
-                                   lw=2.0, alpha=0.90, zorder=5)
         self.pt3_dot,    = ax.plot([], [], 'o', color='white', ms=11,
                                    zorder=6, markeredgecolor='#ffcc00',
                                    markeredgewidth=1.5)
@@ -807,8 +805,6 @@ class App:
         self._surf3d = ax.plot_surface(
             R2, R3, self.surf_z_sm, cmap='plasma',
             alpha=0.82, linewidth=0, antialiased=True)
-        self.traj3d,  = ax.plot([], [], [], '-',
-                                color='#ffcc00', lw=2.2, alpha=0.95, zorder=10)
         self.pt3d,    = ax.plot([], [], [], 'o',
                                 color='#ff4400', ms=8, zorder=11)
         ax.set_xlim(RATIO_MIN, RATIO_MAX)
@@ -953,7 +949,6 @@ class App:
         self.source = 'synth' if synth else 'mic'
         self.audio.accept_mic = not synth
         self.synth.set_active(synth, self.n_notes)
-        self.traj2.clear(); self.traj3.clear()
 
     def _on_view(self, label):
         if 'curve' in label:
@@ -965,25 +960,15 @@ class App:
         if mode == self.view_mode:
             return
         self.view_mode = mode; self.n_notes = n
-        # Keep synth in sync with n_notes
         self.synth.set_active(self.source == 'synth', n)
         self._switch_main_ax()
 
     def _on_key(self, event):
         if event.key == ' ' and self.source == 'synth':
             self.synth.next_chord()
-            self.traj2.clear(); self.traj3.clear()
 
     def _on_clear(self, event):
-        self.traj2.clear(); self.traj3.clear()
-        for attr in ('traj2d', 'traj3_line', 'traj3d'):
-            if hasattr(self, attr):
-                a = getattr(self, attr)
-                try:    a.set_data([], [])
-                except: pass
-                try:    a.set_3d_properties([])
-                except: pass
-        self.fig.canvas.draw_idle()
+        pass   # trajectories removed; button kept for layout
 
     # ── mode switch ───────────────────────────────────────────────────────────
 
@@ -993,7 +978,6 @@ class App:
             except: pass
             self._cbar = None
         self.ax_main.remove()
-        self.traj2.clear(); self.traj3.clear()
         if self.view_mode == 'curve':
             self.ax_main = self.fig.add_subplot(self._gs_main)
             _style_ax(self.ax_main)
@@ -1079,10 +1063,6 @@ class App:
         t_now = time.time() - self.t0
         self.time_hist.append(t_now)
         self.diss_hist.append(self.diss_now if notes_detected else float('nan'))
-        if notes_detected and rms > MIN_RMS:
-            self.traj2.append((self.r2, self.diss_now))
-            if self.n_notes == 3:
-                self.traj3.append((self.r2, self.r3, self.diss_now))
 
         # ── draw ──────────────────────────────────────────────────────────────
         if self.view_mode == 'curve':
@@ -1107,11 +1087,6 @@ class App:
                                       alpha=0.18, color='#4466cc', zorder=3)
         ax.set_ylim(0, 1.15)
         self.pt2d.set_data([self.r2], [self.diss_now])
-        if len(self.traj2) > 1:
-            t = np.array(self.traj2)
-            self.traj2d.set_data(t[:, 0], t[:, 1])
-        else:
-            self.traj2d.set_data([], [])
         if funds:
             parts = [f'f₁ = {funds[0]:.1f} Hz']
             if len(funds) >= 2:
@@ -1138,11 +1113,6 @@ class App:
             self._contour_set = ax.contour(
                 R2, R3, self.surf_z_sm, levels=CONTOUR_LEVELS,
                 colors='white', alpha=0.25, linewidths=0.6, zorder=2)
-        if len(self.traj3) > 1:
-            t = np.array(self.traj3)
-            self.traj3_line.set_data(t[:, 0], t[:, 1])
-        else:
-            self.traj3_line.set_data([], [])
         self.pt3_dot.set_data([self.r2], [self.r3])
         if funds:
             parts = [f'f₁={funds[0]:.1f}']
@@ -1171,14 +1141,8 @@ class App:
             ax.set_xlim(RATIO_MIN, RATIO_MAX); ax.set_ylim(RATIO_MIN, RATIO_MAX)
             ax.set_zlim(0, max(self.surf_z_sm.max()*1.1, 0.05))
             ax.view_init(elev=self._el, azim=self._az)
-        if len(self.traj3) > 1:
-            t = np.array(self.traj3)
-            self.traj3d.set_data(t[:,0], t[:,1])
-            self.traj3d.set_3d_properties(t[:,2])
-            self.pt3d.set_data([self.r2], [self.r3])
-            self.pt3d.set_3d_properties([self.diss_now])
-        else:
-            self.traj3d.set_data([], []); self.traj3d.set_3d_properties([])
+        self.pt3d.set_data([self.r2], [self.r3])
+        self.pt3d.set_3d_properties([self.diss_now])
 
     # ── spectrum update (CQT log-spaced) ─────────────────────────────────────
 
